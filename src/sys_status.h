@@ -1,11 +1,13 @@
 #ifndef SYS_STATUS_H
 #define SYS_STATUS_H
 
+#include "Particle.h"
+
 struct systemStatus_structure {  
   uint8_t structuresVersion;                        // Version of the data structures (system and data)
   uint8_t placeholder;                              // available for future use
   bool clockSet;                                    // Tells us if we need to connect and set the RTC
-  bool connectedStatus;                             // Are we connected?
+  bool placeholder2;                                // Free space - used to be connected status 
   bool verboseMode;                                 // Turns on extra messaging
   bool solarPowerMode;                              // Powered by a solar panel or utility power
   bool lowPowerMode;                                // Does the device need to run disconnected to save battery

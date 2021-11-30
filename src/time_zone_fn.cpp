@@ -1,5 +1,6 @@
 #include "time_zone_fn.h"
 #include "sys_status.h"
+#include "particle_fn.h"
 
 /**
  * @brief Sets the time zone by offset from UTC.
@@ -26,10 +27,10 @@ int setTimeZone(String command)
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);
   if (Particle.connected()) {
     snprintf(data, sizeof(data), "Time zone offset %i",tempTimeZoneOffset);
-    publishQueue.publish("Time",data, PRIVATE);
-    publishQueue.publish("Time",Time.timeStr(Time.now()), PRIVATE);
+    Particle.publish("Time",data, PRIVATE);
+    waitUntil(meterParticlePublish);
+    Particle.publish("Time",Time.timeStr(Time.now()), PRIVATE);
   }
-
   return 1;
 }
 
@@ -55,10 +56,12 @@ int setDSTOffset(String command) {                                      // This 
   systemStatusWriteNeeded = true;
   snprintf(data, sizeof(data), "DST offset %2.1f",sysStatus.dstOffset);
   if (Time.isValid()) isDSTusa() ? Time.beginDST() : Time.endDST();     // Perform the DST calculation here
+  
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);
   if (Particle.connected()) {
-    publishQueue.publish("Time",data, PRIVATE);
-    publishQueue.publish("Time",Time.timeStr(t), PRIVATE);
+    Particle.publish("Time",data, PRIVATE);
+    waitUntil(meterParticlePublish);
+    Particle.publish("Time",Time.timeStr(t), PRIVATE);
   }
   return 1;
 }
@@ -87,7 +90,7 @@ bool isDSTusa() {
     return false;
   }
 
-  boolean beforeFirstSunday = (dayOfMonth - dayOfWeek < 0);
+  boolean beforeFirstSunday = (dayOfMonth - dayOfWeek <= 0); // day of week - Sunday =0 / Saturday = 6   day of month - 1 - 31
   boolean secondSundayOrAfter = (dayOfMonth - dayOfWeek > 7);
 
   if (beforeFirstSunday && !secondSundayOrAfter) return (month == 11);
@@ -113,6 +116,12 @@ bool isDSTusa() {
  *
  * @return true if currently observing DST, false if observing standard time
  */
+
+/***********************************************
+   This feature is not currently implemented
+***********************************************/
+/*
+
 bool isDSTnz() {
   int dayOfMonth = Time.day();
   int month = Time.month();
@@ -144,3 +153,4 @@ bool isDSTnz() {
   }
   return dayStartedAs;
 }
+*/
