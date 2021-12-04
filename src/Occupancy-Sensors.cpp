@@ -27,7 +27,9 @@
 //v5.10 - Version specific to the Machine Vision example
 //v5.20 - Updated to better match new approach to managing connection
 //v6.00 - Updated with logic and structure from v40.01 in Visitation Counters code
-//v6.01 - Fixed issue with ERROR state, tested sleep mode, fixed response_wait state
+//v6.01 - Fixed issue with ERROR state, tested sleep mode, fixed response_wait state, Added WITH_ACK 
+//v6.02 - Fixed issue with too many reconnects - only when changed
+//v6.03 - Added a check for Particle connected
 
 
 // Particle Product definitions
@@ -67,7 +69,7 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 28 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+#line 30 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(6);
 #define DSTRULES isDSTusa
@@ -377,10 +379,11 @@ void loop()
   case NAPPING_STATE: {                                                // This state puts the device in low power mode quickly - napping supports the sensor activity and interrupts
     int wakeInSeconds = 0;
     if (state != oldState) publishStateTransition();
+    if (Particle.connected()) Particle.disconnect();                   // Disconnects from Particle but not from the cellular network
     stayAwake = 1000;                                                  // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     state = IDLE_STATE;                                                // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     ab1805.stopWDT();                                                  // If we are sleeping, we will miss petting the watchdog
-      if (current.occupancyStatus) {                                    // We will set different sleep times based on whether the court is occupied or not
+    if (current.occupancyStatus) {                                     // We will set different sleep times based on whether the court is occupied or not
       wakeInSeconds = constrain((current.debounceMin* 60 - (Time.now() - current.lastOccupancyTime)),1,current.debounceMin*60); // Need to calc based on delay
     }
     else wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);  // Not occupied so wait till the next hour
@@ -390,6 +393,8 @@ void loop()
       .duration(wakeInSeconds * 1000)
       .network(NETWORK_INTERFACE_CELLULAR, SystemSleepNetworkFlag::INACTIVE_STANDBY);           // Not sure how long we will sleep so need to keep the network active - 14mA power 
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
+    delay(1000);           // Debug line
+    Log.info("Waking");
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
     fuelGauge.wakeup();                                                // Make sure the fuelGauge is woke
     stayAwakeTimeStamp = millis();
@@ -434,7 +439,7 @@ void loop()
       }
       // OK, let's do this thing!
       connectionStartTimeStamp = millis();                             // Have to use millis as the clock will get reset on connect
-      Cellular.on();                                                   // Needed until they fix this: https://github.com/particle-iot/device-os/issues/1631
+      if (Cellular.isOff()) Cellular.on();                             // Needed until they fix this: https://github.com/particle-iot/device-os/issues/1631
       Particle.connect();                                              // Told the Particle to connect, now we need to wait
     }
 
@@ -469,6 +474,7 @@ void loop()
     if (state != oldState) publishStateTransition();
     lastReportedTime = Time.now();                                    // We are only going to report once each hour from the IDLE state.  We may or may not connect to Particle
     takeMeasurements();                                               // Take Measurements here for reporting
+    Log.info("Measurements taken - on to sending");
     if (Time.hour() == sysStatus.openTime) dailyCleanup();            // Once a day, clean house and publish to Google Sheets
     sendEvent();                                                      // Publish hourly but not at opening time as there is nothing to publish
     state = CONNECTING_STATE;                                         // We are only passing through this state once each hour
@@ -749,18 +755,36 @@ void firmwareUpdateHandler(system_event_t event, int param) {
 // These are the functions that are part of the takeMeasurements call
 void takeMeasurements()
 {
-  if (Cellular.ready()) getSignalStrength();                          // Test signal strength if the cellular modem is on and ready
+  getTemperature();                                                    // Get Temperature at startup as well
 
-  getTemperature();                                                   // Get Temperature at startup as well
-  
-  // Battery Releated actions
-  if (!isItSafeToCharge()) current.alerts = 11;                       // Alert for not able to charge
-  sysStatus.stateOfCharge = int(System.batteryCharge());              // Percentage of full charge
-  if (sysStatus.stateOfCharge < 30) sysStatus.lowBatteryMode = true;  // Check to see if we are in low battery territory
-  else sysStatus.lowBatteryMode = false;                              // We have sufficient to continue operations
+  sysStatus.batteryState = System.batteryState();                      // Call before isItSafeToCharge() as it may overwrite the context
+
+  isItSafeToCharge();                                                  // See if it is safe to charge
+
+  if (sysStatus.lowPowerMode) {                                        // Need to take these steps if we are sleeping
+    fuelGauge.quickStart();                                            // May help us re-establish a baseline for SoC
+    delay(500);
+  }
+
+  sysStatus.stateOfCharge = int(fuelGauge.getSoC());                   // Assign to system value
+
+  if (sysStatus.stateOfCharge < 65 && sysStatus.batteryState == 1) {
+    System.setPowerConfiguration(SystemPowerConfiguration());          // Reset the PMIC
+    current.alerts = 11;                                               // Keep track of this
+  }
+
+  if (sysStatus.stateOfCharge < current.minBatteryLevel) {
+    current.minBatteryLevel = sysStatus.stateOfCharge;                 // Keep track of lowest value for the day
+    currentStatusWriteNeeded = true;
+  }
+
+  if (sysStatus.stateOfCharge < 30) {
+    sysStatus.lowBatteryMode = true;                                   // Check to see if we are in low battery territory
+    if (!sysStatus.lowPowerMode) setLowPowerMode("1");                 // Should be there already but just in case...
+  }
+  else sysStatus.lowBatteryMode = false;                               // We have sufficient to continue operations
 
   systemStatusWriteNeeded = true;
-  currentStatusWriteNeeded = true;
 }
 
 bool isItSafeToCharge()                                               // Returns a true or false if the battery is in a safe charging range.  
