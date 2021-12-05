@@ -24,13 +24,14 @@
 //v6.01 - Fixed issue with ERROR state, tested sleep mode, fixed response_wait state, Added WITH_ACK 
 //v6.02 - Fixed issue with too many reconnects - only when changed
 //v6.03 - Added a check for Particle connected
+//v7.00 - Looked at issue that could cause repeated publishes, also resets alerts after publish
 
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(6);
+PRODUCT_VERSION(7);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="6.03";
+char currentPointRelease[5] ="7.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -647,10 +648,8 @@ void sendEvent() {
 
   snprintf(data, sizeof(data), "{\"occupancy\":%i, \"dailyoccupancy\":%i, \"battery\":%i,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.occupancyStatus, current.dailyOccupancyMinutes, sysStatus.stateOfCharge, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, timeStampValue);
   PublishQueuePosix::instance().publish("Ubidots-Sensor-Hook-v1", data, (PRIVATE | WITH_ACK));
-  Log.info(data);
-  dataInFlight = true;                                                // set the data inflight flag
-  webhookTimeStamp = millis();
-  lastReportedTime = Time.now();
+  Log.info("Ubidots Webhook: %s", data);                              // For monitoring via serial
+  current.alerts = 0;                                                 // Reset the alert after publish
 }
 
 void UbidotsHandler(const char *event, const char *data) {            // Looks at the response from Ubidots - Will reset Photon if no successful response
@@ -743,17 +742,18 @@ void takeMeasurements()
   systemStatusWriteNeeded = true;
 }
 
-bool isItSafeToCharge()                                               // Returns a true or false if the battery is in a safe charging range.  
-{     
-  sysStatus.batteryState = System.batteryState();
-  PMIC pmic(true);                                                                
-  if (current.temperature < 36 || current.temperature > 100 )  {      // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (32 to 113 but with safety)
-    pmic.disableCharging();                                           // It is too cold or too hot to safely charge the battery
-    sysStatus.batteryState = 1;                                       // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
+bool isItSafeToCharge()                                                // Returns a true or false if the battery is in a safe charging range.
+{
+  PMIC pmic(true);
+  if (current.temperature < 36 || current.temperature > 100 )  {       // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (32 to 113 but with safety)
+    pmic.disableCharging();                                            // It is too cold or too hot to safely charge the battery
+    sysStatus.batteryState = 1;                                        // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
+    current.alerts = 10;                                                // Set a value of 1 indicating that it is not safe to charge due to high / low temps
     return false;
   }
   else {
-    pmic.enableCharging();                                            // It is safe to charge the battery
+    pmic.enableCharging();                                             // It is safe to charge the battery
+    if (current.alerts == 10) current.alerts = 0;                      // Reset the alerts flag if we previously had disabled charging
     return true;
   }
 }
@@ -1193,8 +1193,10 @@ void dailyCleanup() {
   Log.info("Running daily cleanup");
   sysStatus.verboseMode = false;
   sysStatus.clockSet = false;
+  isDSTusa() ? Time.beginDST() : Time.endDST();                        // Perform the DST calculation here - once a day
   if (sysStatus.solarPowerMode || sysStatus.stateOfCharge <= 70) {     // If Solar or if the battery is being discharged
     setLowPowerMode("1");
   }
+  resetEverything();                                                   // If so, we need to Zero the counts for the new day
   systemStatusWriteNeeded = true;
 }
