@@ -31,6 +31,8 @@
 //v6.02 - Fixed issue with too many reconnects - only when changed
 //v6.03 - Added a check for Particle connected
 //v7.00 - Looked at issue that could cause repeated publishes, also resets alerts after publish
+//v8.00 - Small fixes - looking for repeated sending issue.
+//v9.00 - Fixed issue with missed clearing of the occupied flag (>= not >) and potential issue for infinite publishes when going to sleep
 
 
 // Particle Product definitions
@@ -55,7 +57,6 @@ void checkSystemValues();
 void makeUpParkHourStrings();
 void makeUpStringMessages();
 bool disconnectFromParticle();
-bool notConnected();
 int resetCounts(String command);
 int hardResetNow(String command);
 int sendNow(String command);
@@ -70,17 +71,17 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 31 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+#line 33 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(7);
+PRODUCT_VERSION(9);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="7.00";
+char currentPointRelease[5] ="9.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
     versionAddr           = 0x00,                   // Version of the FRAM memory map
     systemStatusAddr      = 0x01,                   // Where we store the system status data structure
-    currentStateAddr     = 0x50                    // Where we store the current counts data structure
+    currentStateAddr      = 0x50                    // Where we store the current counts data structure
   };
 };
 
@@ -187,6 +188,11 @@ volatile bool sensorDetect = false;                 // This is the flag that an 
 
 void setup()                                        // Note: Disconnected Setup()
 {
+  #if defined(DEBUG_BUILD)
+  BLE.off();
+  #endif
+
+  delay(2000);          //*****  Debug ***
   pinMode(wakeUpPin,INPUT);                         // This pin is active HIGH
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
@@ -289,9 +295,10 @@ void setup()                                        // Note: Disconnected Setup(
   isDSTusa() ? Time.beginDST() : Time.endDST();                        // Perform the DST calculation here
   Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
+  Log.info("From setup DST offset is %s",currentOffsetStr);
 
   // If  the user is holding the user button - we will load defaults
-  if (!digitalRead(userSwitch)) loadSystemDefaults();                  // Make sure the device wakes up and connects - reset to defaults and exit low power mode
+  if (!digitalRead(userSwitch)) setLowPowerMode("0");                   // The user button can make sure the device connects (unless it is during closing hours)
 
   // Strings make it easier to read the system values in the console / mobile app
   makeUpStringMessages();                                              // Updated system settings - refresh the string messages
@@ -314,6 +321,7 @@ void setup()                                        // Note: Disconnected Setup(
     current.occupancyStatus = false;                                   // Reset at power up
     attachInterrupt(intPin, sensorISR, RISING);                        // Pressure Sensor interrupt from low to high
     stayAwake = stayAwakeLong;                                         // Keeps Boron awake after reboot - helps with recovery
+    lastReportedTime = current.lastOccupancyChange;                    // When did we last see a change in occupancy
     if (!sysStatus.lowPowerMode) state = CONNECTING_STATE;             // If we are not in low power mode, we should connect
   }
 
@@ -329,9 +337,12 @@ void loop()
 {
   switch(state) {
   case IDLE_STATE:                                                     // Where we spend most time - note, the order of these conditionals is important
-    if (state != oldState) publishStateTransition();
+    if (state != oldState) {
+      publishStateTransition();
+      Log.info("Idle state - Hours are %i, open is %i, close is %i and hour of last report is %i",Time.hour(), sysStatus.openTime, sysStatus.closeTime, Time.hour(lastReportedTime));
+    } 
     if (sensorDetect) serviceSensorEvent();                           // The ISR had raised the sensor flag - we can service it here as we don't need to catch every one like when counting cars
-    if ((Time.now() > current.lastOccupancyTime + current.debounceMin * 60) && current.occupancyStatus) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
+    if ((Time.now() >= current.lastOccupancyTime + current.debounceMin * 60) && current.occupancyStatus) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (firmwareUpdateInProgress) state= FIRMWARE_UPDATE;                                                     // This means there is a firemware update on deck
     if (Time.hour() != Time.hour(lastReportedTime)) {
@@ -346,7 +357,7 @@ void loop()
     detachInterrupt(intPin);                                           // Done sensing for the day
     sensorControl(false);                                              // Turn off the sensor module for the hour
     if (current.occupancyStatus) {                                     // If the court is still showing as occupied, we need to wait
-      state = REPORTING_STATE;
+      serviceDebounceEvent();                                          // Reset for the day
       break;
     }
     if (Particle.connected() || !Cellular.isOff()) disconnectFromParticle();  // Disconnect cleanly from Particle
@@ -660,7 +671,7 @@ void serviceSensorEvent()                                             // We only
   if (!current.occupancyStatus) {                                     // You can get multiple PIR events while the court is occupied - but we need to do some extra things if state was previously not occupied
     pinSetFast(blueLED);                                              // Turn on the blue LED
     current.occupancyStatus = true;
-    snprintf(occupancyStateStr, sizeof(occupancyStateStr), "%s", (current.occupancyStatus) ? "Occupied" : "Not Occupied");  // Update the string for the Particle variable
+    snprintf(occupancyStateStr, sizeof(occupancyStateStr), "Occupied");  // Update the string for the Particle variable
     Log.info(occupancyStateStr);
     current.lastOccupancyChange = Time.now();
     state = REPORTING_STATE;                                          // Occupancy state changed - need to report
@@ -672,7 +683,7 @@ void serviceSensorEvent()                                             // We only
 
 void serviceDebounceEvent() {                                         // We get here when it has been over the debounce period and we are in occupied state
   current.occupancyStatus = false;
-  snprintf(occupancyStateStr, sizeof(occupancyStateStr), "%s", (current.occupancyStatus) ? "Occupied" : "Not Occupied");  // Update the string for the Particle variable
+  snprintf(occupancyStateStr, sizeof(occupancyStateStr), "Not Occupied");  // Update the string for the Particle variable
   Log.info(occupancyStateStr);
   int newMinutes = (Time.now() - current.lastOccupancyChange)/60;
   current.lastOccupancyChange = Time.now();
@@ -685,11 +696,8 @@ void serviceDebounceEvent() {                                         // We get 
 
 void sendEvent() {
   char data[256];                                                     // Store the date in this character array - not global
-  unsigned long timeStampValue;                                       // Going to start sending timestamps - and will modify for midnight to fix reporting issue
 
-  timeStampValue = Time.now();
-
-  snprintf(data, sizeof(data), "{\"occupancy\":%i, \"dailyoccupancy\":%i, \"battery\":%i,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.occupancyStatus, current.dailyOccupancyMinutes, sysStatus.stateOfCharge, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, timeStampValue);
+  snprintf(data, sizeof(data), "{\"occupancy\":%i, \"dailyoccupancy\":%i, \"battery\":%i,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.occupancyStatus, current.dailyOccupancyMinutes, sysStatus.stateOfCharge, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
   PublishQueuePosix::instance().publish("Ubidots-Sensor-Hook-v1", data, (PRIVATE | WITH_ACK));
   Log.info("Ubidots Webhook: %s", data);                              // For monitoring via serial
   current.alerts = 0;                                                 // Reset the alert after publish
@@ -949,12 +957,8 @@ void makeUpStringMessages() {
 bool disconnectFromParticle()                                     // Ensures we disconnect cleanly from Particle
 {
   Particle.disconnect();
-  waitFor(notConnected, 15000);                                   // make sure before turning off the cellular modem
+  waitFor(Particle.disconnected, 15000);                                   // make sure before turning off the cellular modem
   return true;
-}
-
-bool notConnected() {                                             // Companion function for disconnectFromParticle
-  return !Particle.connected();
 }
 
 int resetCounts(String command)                                       // Resets the current hourly and daily counts
@@ -1000,9 +1004,11 @@ int sendNow(String command) // Function to force sending data in current hour
  */
 void resetEverything() {                                              // The device is waking up in a new day or is a new install
   char data[64];
+  Log.info("Resetting everything");
   current.longestOccupancyMinutes = 0;                                // Reset the counts in FRAM as well
   current.dailyOccupancyMinutes = 0;                                  // Reset for the day
   current.lastOccupancyChange = Time.now();                           // Set the time context to the new day
+  current.occupancyStatus = false;                                    // Reset at closing time
   if (current.alerts == 23 || current.updateAttempts >=3) {           // We had tried to update enough times that we disabled updates for the day - resetting
     System.enableUpdates();
     current.alerts = 0;
