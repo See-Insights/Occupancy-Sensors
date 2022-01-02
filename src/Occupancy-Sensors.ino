@@ -34,7 +34,7 @@
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(10);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="10.00";
+char currentPointRelease[6] = "10.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {

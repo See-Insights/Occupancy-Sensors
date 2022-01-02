@@ -33,6 +33,7 @@
 //v7.00 - Looked at issue that could cause repeated publishes, also resets alerts after publish
 //v8.00 - Small fixes - looking for repeated sending issue.
 //v9.00 - Fixed issue with missed clearing of the occupied flag (>= not >) and potential issue for infinite publishes when going to sleep
+//v10.00 - Turns off cellular modem at night and does not maintain network connection if battery level is under 65%
 
 
 // Particle Product definitions
@@ -71,11 +72,11 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 33 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+#line 34 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(9);
+PRODUCT_VERSION(10);
 #define DSTRULES isDSTusa
-char currentPointRelease[5] ="9.00";
+char currentPointRelease[6] = "10.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
