@@ -391,7 +391,6 @@ void loop()
   case NAPPING_STATE: {                                                // This state puts the device in low power mode quickly - napping supports the sensor activity and interrupts
     int wakeInSeconds = 0;
     if (state != oldState) publishStateTransition();
-    if (Particle.connected()) Particle.disconnect();                   // Disconnects from Particle but not from the cellular network
     stayAwake = 1000;                                                  // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     state = IDLE_STATE;                                                // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     ab1805.stopWDT();                                                  // If we are sleeping, we will miss petting the watchdog
@@ -399,11 +398,21 @@ void loop()
       wakeInSeconds = constrain((current.debounceMin* 60 - (Time.now() - current.lastOccupancyTime)),1,current.debounceMin*60); // Need to calc based on delay
     }
     else wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);  // Not occupied so wait till the next hour
-    config.mode(SystemSleepMode::ULTRA_LOW_POWER)
+    if (sysStatus.stateOfCharge > 65) {                                // Will stay on network standby if we have the power
+      config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
       .gpio(intPin,RISING)
       .duration(wakeInSeconds * 1000)
       .network(NETWORK_INTERFACE_CELLULAR, SystemSleepNetworkFlag::INACTIVE_STANDBY);           // Not sure how long we will sleep so need to keep the network active - 14mA power 
+      if (Particle.connected()) Particle.disconnect();                // Disconnects from Particle but not from the cellular network
+    }
+    else {                                                            // Else we will drop off the network
+      config.mode(SystemSleepMode::ULTRA_LOW_POWER)
+      .gpio(userSwitch,CHANGE)
+      .gpio(intPin,RISING)
+      .duration(wakeInSeconds * 1000);
+      disconnectFromParticle();                                       // This will turn off the cellular radio
+    }
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     Log.info("Waking");
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
@@ -954,10 +963,16 @@ void makeUpStringMessages() {
 }
 
 
-bool disconnectFromParticle()                                     // Ensures we disconnect cleanly from Particle
+bool disconnectFromParticle()                                          // Ensures we disconnect cleanly from Particle
+                                                                       // Updated based on this thread: https://community.particle.io/t/waitfor-particle-connected-timeout-does-not-time-out/59181
 {
+  Log.info("In the disconnect from Particle function");
   Particle.disconnect();
-  waitFor(Particle.disconnected, 15000);                                   // make sure before turning off the cellular modem
+  waitFor(Particle.disconnected, 15000);                               // make sure before turning off the cellular modem
+  Cellular.disconnect();                                               // Disconnect from the cellular network
+  Cellular.off();                                                      // Turn off the cellular modem
+  waitFor(Cellular.isOff, 30000);                                      // As per TAN004: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
+  systemStatusWriteNeeded = true;
   return true;
 }
 
