@@ -34,6 +34,7 @@
 //v8.00 - Small fixes - looking for repeated sending issue.
 //v9.00 - Fixed issue with missed clearing of the occupied flag (>= not >) and potential issue for infinite publishes when going to sleep
 //v10.00 - Turns off cellular modem at night and does not maintain network connection if battery level is under 65%
+//v11.00 - Need to make some additional adjustments - Logging and hourly connections when battery < 65%
 
 
 // Particle Product definitions
@@ -72,11 +73,11 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 34 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+#line 35 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(10);
+PRODUCT_VERSION(11);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] = "10.00";
+char currentPointRelease[6] = "11.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -400,6 +401,7 @@ void loop()
     }
     else wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);  // Not occupied so wait till the next hour
     if (sysStatus.stateOfCharge > 65) {                                // Will stay on network standby if we have the power
+      Log.info("Napping with radio on");
       config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
       .gpio(intPin,RISING)
@@ -408,12 +410,14 @@ void loop()
       if (Particle.connected()) Particle.disconnect();                // Disconnects from Particle but not from the cellular network
     }
     else {                                                            // Else we will drop off the network
+      Log.info("Napping with radio off");
       config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
       .gpio(intPin,RISING)
       .duration(wakeInSeconds * 1000);
-      disconnectFromParticle();                                       // This will turn off the cellular radio
+      if (Particle.connected() || Cellular.isOn()) disconnectFromParticle();  // This will turn off the cellular radio
     }
+    delay(200);                     // Time to write to the Log
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     Log.info("Waking");
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
@@ -452,7 +456,7 @@ void loop()
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;
         }                                                              // Leave this state and go connect - will return only if we are successful in connecting
-        else if (sysStatus.stateOfCharge <= 65 && (Time.hour() % 2)) { // If the battery level is 50% -  65%, only connect every other hour
+        else if (sysStatus.stateOfCharge <= 65 && (Time.hour() - sysStatus.lastConnection < 3600)) { // If the battery level is 50% -  65%, connect only once an hour
           Log.info("Connecting but 50-65%% charge - two hour schedule");
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;                                                       // Leave this state and go connect - will return only if we are successful in connecting
