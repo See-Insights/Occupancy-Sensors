@@ -29,13 +29,16 @@
 //v9.00 - Fixed issue with missed clearing of the occupied flag (>= not >) and potential issue for infinite publishes when going to sleep
 //v10.00 - Turns off cellular modem at night and does not maintain network connection if battery level is under 65%
 //v11.00 - Need to make some additional adjustments - Logging and hourly connections when battery < 65%
+//v12.00 - Update to deviceOS@4.0.2 and removed firmware update state
+//v13.00 - Added a check last connection time and deviceOS@4.1.0
+//v14.00 - Working on why the device keeps dropping off-line compiled for deviceOS@4.2.0
+//v15.00 - Compiled for deviceOS@5.5.0 - so we can use the Boron BRN-404X
 
 
 // Particle Product definitions
-PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
-PRODUCT_VERSION(11);
+PRODUCT_VERSION(15);
 #define DSTRULES isDSTusa
-char currentPointRelease[6] = "11.00";
+char currentPointRelease[6] = "15.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -95,8 +98,8 @@ FuelGauge fuelGauge;                                // Needed to address issue w
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // State Machine Variables
-enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, CONNECTING_STATE, REPORTING_STATE, RESP_WAIT_STATE, FIRMWARE_UPDATE};
-char stateNames[9][16] = {"Initialize", "Error", "Idle", "Sleeping", "Napping", "Connecting", "Reporting", "Response Wait", "Firmware Update"};
+enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, CONNECTING_STATE, REPORTING_STATE, RESP_WAIT_STATE};
+char stateNames[9][16] = {"Initialize", "Error", "Idle", "Sleeping", "Napping", "Connecting", "Reporting", "Response Wait"};
 State state = INITIALIZATION_STATE;
 State oldState = INITIALIZATION_STATE;
 
@@ -110,7 +113,7 @@ const int wakeUpPin =     D8;                       // This is the Particle Elec
 const int blueLED =       D7;                       // This LED is on the Electron itself
 const int userSwitch =    D4;                       // User switch with a pull-up resistor
 // Pin Constants - Sensor
-const int intPin =        SCK;                       // Sensor inerrupt pin
+const int intPin =        SCK;                      // Sensor inerrupt pin
 const int disableModule = MOSI;                     // Bringining this low turns on the sensor (pull-up on sensor board)
 const int ledPower =      MISO;                     // Allows us to control the indicator LED on the sensor board
 
@@ -168,7 +171,6 @@ void setup()                                        // Note: Disconnected Setup(
   String deviceID = System.deviceID();              // Multiple devices share the same hook - keeps things straight
   deviceID.toCharArray(responseTopic,125);          // Puts the deviceID into the response topic array
   Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
-  System.on(firmware_update, firmwareUpdateHandler);// Registers a handler that will track if we are getting an update
   System.on(out_of_memory, outOfMemoryHandler);     // Enabling an out of memory handler is a good safety tip. If we run out of memory a System.reset() is done.
 
 
@@ -304,12 +306,11 @@ void loop()
     if (sensorDetect) serviceSensorEvent();                           // The ISR had raised the sensor flag - we can service it here as we don't need to catch every one like when counting cars
     if ((Time.now() >= current.lastOccupancyTime + current.debounceMin * 60) && current.occupancyStatus) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
-    if (firmwareUpdateInProgress) state= FIRMWARE_UPDATE;                                                     // This means there is a firemware update on deck
     if (Time.hour() != Time.hour(lastReportedTime)) {
         stayAwake = stayAwakeLong;                                    // Keeps device awake after reboot - helps with recovery
         state = REPORTING_STATE;                                      // We want to report on the hour but not after bedtime
     }     
-    if ((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
+    if (timeToSleep()) state = SLEEPING_STATE;                        // The park is closed - sleep
     break;
 
   case SLEEPING_STATE: {                                               // This state is triggered once the park closes and runs until it opens - Sensor is off and interrupts disconnected
@@ -409,8 +410,8 @@ void loop()
       }
       // If we are in low power mode, we may bail if battery is too low and we need to reduce reporting frequency
       if (sysStatus.lowPowerMode && digitalRead(userSwitch)) {         // Low power mode and user switch not pressed
-        if (sysStatus.stateOfCharge <= 50 && (Time.hour() % 4)) {      // If the battery level is <50%, only connect every fourth hour
-          Log.info("Connecting but <50%% charge - four hour schedule");
+        if (sysStatus.stateOfCharge <= 50 && (Time.hour() % 3)) {      // If the battery level is <50%, only connect every third hour
+          Log.info("Connecting but <50%% charge - three hour schedule");
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;
         }                                                              // Leave this state and go connect - will return only if we are successful in connecting
@@ -486,7 +487,7 @@ void loop()
 
   case ERROR_STATE: {                                                  // New and improved - now looks at the alert codes
     if (state != oldState) publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
-    if (millis() > resetTimeStamp + resetWait) {                       // This simply gives us some time to catch the device if it is in a reset loop
+    if (millis() - resetTimeStamp > resetWait) {                       // This simply gives us some time to catch the device if it is in a reset loop
       if (Particle.connected()) {                                      // If we are connected to Particle - let's publish to let folks know what is going on
         char errorStr[64];
         snprintf(errorStr, sizeof(errorStr),"Resetting device with alert code %i",current.alerts);
@@ -503,6 +504,8 @@ void loop()
 
         case 30 ... 31:                                                // Device failed to connect too many times
           sysStatus.lastConnection = Time.now();                       // Make sure we don't do this very often
+          current.alerts = 0;
+          fram.put(FRAM::currentStateAddr,current);
           fram.put(FRAM::systemStatusAddr,sysStatus);                  // Unless a FRAM error sent us here - store alerts value
           delay(100);                                                  // Time to write to FRAM
           System.reset();  
@@ -510,6 +513,8 @@ void loop()
 
         case 13:                                                       // Excessive resets of the device - time to power cycle
           sysStatus.resetCount = 0;                                    // Reset so we don't do this too often
+          current.alerts = 0;
+          fram.put(FRAM::currentStateAddr,current);
           fram.put(FRAM::systemStatusAddr,sysStatus);                  // Won't get back to the main loop
           delay (100);
           ab1805.deepPowerDown();                                      // 30 second power cycle of Boron including cellular modem, carrier board and all peripherals
@@ -530,29 +535,6 @@ void loop()
     }
     } break;
 
-  case FIRMWARE_UPDATE: {
-      static unsigned long stateTime;
-      char data[64];
-
-      if (state != oldState) {
-        stateTime = millis();                                          // When did we start the firmware update?
-        Log.info("In the firmware update state");
-        publishStateTransition();
-      }
-      if (!firmwareUpdateInProgress) {                                 // Done with the update
-          Log.info("firmware update completed");
-          state = IDLE_STATE;
-      }
-      else
-      if (millis() - stateTime >= firmwareUpdateMaxTime.count()) {     // Ran out of time
-          Log.info("firmware update timed out");
-          current.alerts = 21;                                          // Record alert for timeout
-          snprintf(data, sizeof(data), "{\"alerts\":%i,\"timestamp\":%lu000 }",current.alerts, Time.now());
-          PublishQueuePosix::instance().publish("Ubidots_Alert_Hook", data, PRIVATE);
-          current.updateAttempts++;                                    // Increment the update attempt counter
-          state = IDLE_STATE;
-      }
-    } break;
   }
   // Take care of housekeeping items here
 
@@ -577,6 +559,10 @@ void loop()
   // End of housekeeping - end of main loop
 }
 
+bool timeToSleep() {          // Returns true if we should be sleeping
+  if((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) return true;
+  else return false;
+}
 
 void sensorControl(bool enableSensor) {                               // What is the sensor type - 0-Pressure Sensor, 1-PIR Sensor
 
@@ -692,43 +678,6 @@ void UbidotsHandler(const char *event, const char *data) {            // Looks a
   }
   // Particle.publish("Ubidots Hook", responseString, PRIVATE);
 }
-
-/**
- * @brief The Firmware update handler tracks changes in the firmware update status
- *
- * @details This handler is subscribed to in setup with System.on event and sets the firmwareUpdateinProgress flag that
- * will trigger a state transition to the Firmware update state.  As some events are only see in this handler, failure
- * and success success codes are assigned here and the time out code in the main loop state.
- *
- * @param event  - Firmware update
- * @param param - Specific firmware update state
- */
-
-void firmwareUpdateHandler(system_event_t event, int param) {
-  switch(param) {
-    char data[64];                                                     // Store the date in this character array - not global
-
-    case firmware_update_begin:
-      firmwareUpdateInProgress = true;
-      break;
-    case firmware_update_complete:
-      firmwareUpdateInProgress = false;
-      current.alerts = 20;                                             // Record a successful attempt
-      snprintf(data, sizeof(data), "{\"alerts\":%i,\"timestamp\":%lu000 }",current.alerts, Time.now());
-      PublishQueuePosix::instance().publish("Ubidots_Alert_Hook", data, PRIVATE); // Put in publish queue
-      current.updateAttempts = 0;                                      // Zero the update attempts counter
-      break;
-    case firmware_update_failed:
-      firmwareUpdateInProgress = false;
-      current.alerts = 22;                                             // Record a failed attempt
-      snprintf(data, sizeof(data), "{\"alerts\":%i,\"timestamp\":%lu000 }",current.alerts, Time.now());
-      PublishQueuePosix::instance().publish("Ubidots_Alert_Hook", data, PRIVATE); // Put in publlish queue
-      current.updateAttempts++;                                        // Increment the update attempts counter
-      break;
-  }
-  currentStatusWriteNeeded = true;
-}
-
 
 // These are the functions that are part of the takeMeasurements call
 void takeMeasurements()
@@ -870,8 +819,10 @@ void checkSystemValues() {                                          // Checks to
   if (sysStatus.dstOffset < 0 || sysStatus.dstOffset > 2) sysStatus.dstOffset = 1;
   if (sysStatus.openTime < 0 || sysStatus.openTime > 12) sysStatus.openTime = 0;
   if (sysStatus.closeTime < 12 || sysStatus.closeTime > 24) sysStatus.closeTime = 24;  
+  if (current.debounceMin < 1 || current.debounceMin > 10) current.debounceMin = 5;
   if (sysStatus.lastConnectionDuration > connectMaxTimeSec) sysStatus.lastConnectionDuration = 0;
   systemStatusWriteNeeded = true;
+  currentStatusWriteNeeded = true;
 }
 
  // These are the particle functions that allow you to configure and run the device
