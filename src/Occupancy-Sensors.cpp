@@ -2,7 +2,6 @@
 //       THIS IS A GENERATED FILE - DO NOT EDIT       //
 /******************************************************/
 
-#include "Particle.h"
 #line 1 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 /*
 * Project Occupancy Sensors - Building a variant of the visitaion counters to determine the occupancy state
@@ -38,7 +37,20 @@
 //v12.00 - Update to deviceOS@4.0.2 and removed firmware update state
 //v13.00 - Added a check last connection time and deviceOS@4.1.0
 //v14.00 - Working on why the device keeps dropping off-line compiled for deviceOS@4.2.0
+//v15.00 - Compiled for deviceOS@5.5.0 - so we can use the Boron BRN-404X
+//v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing
 
+
+// Included Libraries
+#include "Particle.h"                               // Particle Library
+#include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
+#include "AB1805_RK.h"                              // Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
+#include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
+#include "PublishQueuePosixRK.h"                    // Allows for queuing of messages - https://github.com/rickkas7/PublishQueuePosixRK
+
+// Libraries with helper functions
+#include "time_zone_fn.h"
+#include "sys_status.h"
 
 // Particle Product definitions
 void setup();
@@ -76,10 +88,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 38 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
-PRODUCT_VERSION(14);
-#define DSTRULES isDSTusa
-char currentPointRelease[6] = "14.00";
+#line 51 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+PRODUCT_VERSION(16);
+
+char currentPointRelease[6] = "16.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -91,33 +103,25 @@ namespace FRAM {                                    // Moved to namespace instea
 
 const int FRAMversionNumber = 1;                    // Increment this number each time the memory map is changed
 
-
 struct currentStatus_structure {                    // currently 10 bytes long
-  bool occupancyStatus;                             // Occupied or not
-  time32_t lastOccupancyTime;                       // When as it last occupied?
-  time32_t lastOccupancyChange;                     // When did the occupancy status last change
+  uint16_t maxConnectTime = 0;                      // Longest connect time for the day
+  uint8_t updateAttempts = 0;                       // How many update attempts today
+  bool occupancyStatus = false;                     // Occupied or not - false at boot up
+  time32_t lastOccupancyTime;                         // When as it last occupied?
+  time32_t lastOccupancyChange;                       // When did the occupancy status last change
   int dailyOccupancyMinutes;                        // How many minutes has it been occupied today
   int longestOccupancyMinutes;                      // What was the longest it was occupied today
   int debounceMin;                                  // What is the time we will wait before assuming no occupancy
   int temperature;                                  // Current Temperature
   int alerts;                                       // What is the current alert count
-  uint16_t maxConnectTime = 0;                      // Longest connect time for the day
   int minBatteryLevel = 100;                        // Lowest Battery level for the day
-  uint8_t updateAttempts = 0;                       // How many update attempts today
 } current;
 
-
-// Included Libraries
-#include "3rdGenDevicePinoutdoc.h"                  // Pinout Documentation File
-#include "AB1805_RK.h"                              // Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
-#include "MB85RC256V-FRAM-RK.h"                     // Rickkas Particle based FRAM Library
-#include "PublishQueuePosixRK.h"                    // Allows for queuing of messages - https://github.com/rickkas7/PublishQueuePosixRK
-
-// Libraries with helper functions
-#include "time_zone_fn.h"
-#include "sys_status.h"
-
 struct systemStatus_structure sysStatus;
+
+#define DSTRULES isDSTusa
+// Using this flag will allow the code to run without connecting to the cellular network
+#define OFFLINEMODE 0                               // Value = 1 - no cellular and 0 for normal operations
 
 // exceeded, do a deep power down. This should not be less than 10 minutes. 11 minutes
 // is a reasonable value to use.
@@ -192,11 +196,9 @@ volatile bool sensorDetect = false;                 // This is the flag that an 
 
 void setup()                                        // Note: Disconnected Setup()
 {
-  #if defined(DEBUG_BUILD)
-  BLE.off();
-  #endif
 
-  delay(2000);          //*****  Debug ***
+  if (OFFLINEMODE) waitFor(Serial.isConnected,10000);    // If we are in off-line mode, we need to wait for the serial connection
+
   pinMode(wakeUpPin,INPUT);                         // This pin is active HIGH
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
@@ -242,7 +244,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.function("Set-Close",setCloseTime);
 
   Particle.setDisconnectOptions(CloudDisconnectOptions().graceful(true).timeout(5s));  // Don't disconnect abruptly
-
 // Watchdog Timer and Real Time Clock Initialization
   ab1805.withFOUT(D8).setup();                                         // The carrier board has D8 connected to FOUT for wake interrupts
   ab1805.setWDT(AB1805::WATCHDOG_MAX_SECONDS);                         // Enable watchdog
@@ -270,6 +271,12 @@ void setup()                                        // Note: Disconnected Setup(
   else {
     fram.get(FRAM::systemStatusAddr,sysStatus);                        // Loads the System Status array from FRAM
     fram.get(FRAM::currentStateAddr,current);                         // Loead the current values array from FRAM
+  }
+
+  if (OFFLINEMODE) {                                                   // This sets values for testing without a cellular connection
+    sysStatus.openTime = 0;                                            // This is for the edge case where the clock is not set and the device won't connect as it thinks it is off hours
+    sysStatus.closeTime = 24;                                          // This only resets if the device beleives it is off-hours
+    current.debounceMin = 1;                                           // This is for the edge case where the clock is not set and the device won't connect as it thinks it is off hours; 
   }
 
   // Now that the system object is loaded - let's make sure the values make sense
@@ -309,7 +316,6 @@ void setup()                                        // Note: Disconnected Setup(
   // Make sure we have the right power settings
   setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
 
-
   // Here is where the code diverges based on why we are running Setup()
   // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over  
   if (Time.day() != Time.day(current.lastOccupancyChange)) {           // Check to see if the device was last on in a different day
@@ -322,7 +328,7 @@ void setup()                                        // Note: Disconnected Setup(
   if ((Time.hour() >= sysStatus.openTime) && (Time.hour() < sysStatus.closeTime)) { // Park is open let's get ready for the day
     sensorControl(true);                                               // Turn on the sensor
     current.occupancyStatus = false;                                   // Reset at power up
-    attachInterrupt(intPin, sensorISR, RISING);                        // Pressure Sensor interrupt from low to high
+    attachInterrupt(intPin, sensorISR, RISING);                        // Sensor interrupt from low to high
     stayAwake = stayAwakeLong;                                         // Keeps Boron awake after reboot - helps with recovery
     lastReportedTime = current.lastOccupancyChange;                    // When did we last see a change in occupancy
     if (!sysStatus.lowPowerMode) state = CONNECTING_STATE;             // If we are not in low power mode, we should connect
@@ -331,7 +337,7 @@ void setup()                                        // Note: Disconnected Setup(
   if (state == INITIALIZATION_STATE) state = IDLE_STATE;               // IDLE unless otherwise from above code
 
   systemStatusWriteNeeded = true;                                      // Update FRAM with any changes from setup
-  Log.info("Startup complete");
+  Log.info("Startup complete with version %s in %s mode", currentPointRelease, OFFLINEMODE ? "Off Line" : "Normal");
   digitalWrite(blueLED,LOW);                                           // Signal the end of startup
 }
 
@@ -345,7 +351,7 @@ void loop()
       Log.info("Idle state - Hours are %i, open is %i, close is %i and hour of last report is %i",Time.hour(), sysStatus.openTime, sysStatus.closeTime, Time.hour(lastReportedTime));
     } 
     if (sensorDetect) serviceSensorEvent();                           // The ISR had raised the sensor flag - we can service it here as we don't need to catch every one like when counting cars
-    if ((Time.now() >= current.lastOccupancyTime + current.debounceMin * 60) && current.occupancyStatus) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
+    if (current.occupancyStatus && (Time.now() >= current.lastOccupancyTime + current.debounceMin * 60)) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (Time.hour() != Time.hour(lastReportedTime)) {
         stayAwake = stayAwakeLong;                                    // Keeps device awake after reboot - helps with recovery
@@ -435,8 +441,9 @@ void loop()
       sysStatus.lastConnectionDuration = 0;                            // Will exit with 0 if we do not connect or are connected or the connection time if we do
       publishStateTransition();
 
+
       // Let's make sure we need to connect
-      if (Particle.connected()) {
+      if (Particle.connected() || OFFLINEMODE) {                       // If we are already connected or we are in off-line mode we don't need to connect
         Log.info("Connecting state but already connected");
         stayAwakeTimeStamp = millis();
         (retainedOldState == REPORTING_STATE) ? state = RESP_WAIT_STATE : state = IDLE_STATE;
@@ -512,7 +519,7 @@ void loop()
       dataInFlight = true;                                            // set the data inflight flag
       publishStateTransition();
     }
-    if (!dataInFlight)  {                                             // Response received --> back to IDLE state
+    if (!dataInFlight || OFFLINEMODE)  {                              // Response received or we are in off-line mode --> back to IDLE state
       state = IDLE_STATE;
     }
     else if (millis() - webhookTimeStamp > webhookWait) {             // If it takes too long - will need to reset
