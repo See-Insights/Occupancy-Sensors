@@ -33,7 +33,8 @@
 //v13.00 - Added a check last connection time and deviceOS@4.1.0
 //v14.00 - Working on why the device keeps dropping off-line compiled for deviceOS@4.2.0
 //v15.00 - Compiled for deviceOS@5.5.0 - so we can use the Boron BRN-404X
-//v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing
+//v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing.  
+//v16.10 - Added regular updates when occupied the minutes are set on line 125
 
 
 // Included Libraries
@@ -66,8 +67,8 @@ struct currentStatus_structure {                    // currently 10 bytes long
   uint16_t maxConnectTime = 0;                      // Longest connect time for the day
   uint8_t updateAttempts = 0;                       // How many update attempts today
   bool occupancyStatus = false;                     // Occupied or not - false at boot up
-  time32_t lastOccupancyTime;                         // When as it last occupied?
-  time32_t lastOccupancyChange;                       // When did the occupancy status last change
+  time32_t lastOccupancyTime;                       // When as it last occupied?
+  time32_t lastOccupancyChange;                     // When did the occupancy status last change
   int dailyOccupancyMinutes;                        // How many minutes has it been occupied today
   int longestOccupancyMinutes;                      // What was the longest it was occupied today
   int debounceMin;                                  // What is the time we will wait before assuming no occupancy
@@ -82,11 +83,10 @@ struct systemStatus_structure sysStatus;
 // Using this flag will allow the code to run without connecting to the cellular network
 #define OFFLINEMODE 0                               // Value = 1 - no cellular and 0 for normal operations
 
+
 // exceeded, do a deep power down. This should not be less than 10 minutes. 11 minutes
 // is a reasonable value to use.
 unsigned long connectMaxTimeSec = 10 * 60;   // Timeout for trying to connect to Particle cloud in seconds - reduced to 10 mins
-// If updating, we need to delay sleep in order to give the download time to come through before sleeping
-const std::chrono::milliseconds firmwareUpdateMaxTime = 10min; // Set at least 5 minutes
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
@@ -121,7 +121,8 @@ const int intPin =        SCK;                      // Sensor inerrupt pin
 const int disableModule = MOSI;                     // Bringining this low turns on the sensor (pull-up on sensor board)
 const int ledPower =      MISO;                     // Allows us to control the indicator LED on the sensor board
 
-// Timing Variables                         
+// Timing Variables    
+const int occupancyUpdateMins = 15;                 // Set this value to get regular updates to daily occupancy when occupied = true                     
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
 const unsigned long stayAwakeLong = 90000;          // In lowPowerMode, how long to stay awake every hour
 const unsigned long webhookWait = 30000;            // How long will we wait for a WebHook response
@@ -639,8 +640,15 @@ void serviceSensorEvent()                                             // We only
     snprintf(occupancyStateStr, sizeof(occupancyStateStr), "Occupied");  // Update the string for the Particle variable
     Log.info(occupancyStateStr);
     current.lastOccupancyChange = Time.now();
-    state = REPORTING_STATE;                                          // Occupancy state changed - need to report
   }
+  else {                                                              // Already occupied - we need to update the time
+    if (Time.now() - lastReportedTime > occupancyUpdateMins) {        // We are occupied but we need to report every so often - this is the time to do it
+      int newMinutes = round((Time.now() - current.lastOccupancyChange)/60.0);
+      current.lastOccupancyChange = Time.now();
+      current.dailyOccupancyMinutes += newMinutes;
+    }
+  }
+  state = REPORTING_STATE;                                            // Need to report our new daily number
   sensorDetect = false;                                               // Reset the flag
   currentStatusWriteNeeded = true;                                    // Write updated values to FRAM
 }
@@ -650,7 +658,7 @@ void serviceDebounceEvent() {                                         // We get 
   current.occupancyStatus = false;
   snprintf(occupancyStateStr, sizeof(occupancyStateStr), "Not Occupied");  // Update the string for the Particle variable
   Log.info(occupancyStateStr);
-  int newMinutes = (Time.now() - current.lastOccupancyChange)/60;
+  int newMinutes = round((Time.now() - current.lastOccupancyChange)/60.0);
   current.lastOccupancyChange = Time.now();
   current.dailyOccupancyMinutes += newMinutes;
   currentStatusWriteNeeded = true;
