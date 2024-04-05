@@ -39,7 +39,8 @@
 //v14.00 - Working on why the device keeps dropping off-line compiled for deviceOS@4.2.0
 //v15.00 - Compiled for deviceOS@5.5.0 - so we can use the Boron BRN-404X
 //v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing.  
-//v16.10 - Added regular updates when occupied.
+//v16.10 - Added regular updates when occupied the minutes are set on line 125
+//v16.11 - Added a check to reduce reporting
 
 
 // Included Libraries
@@ -89,10 +90,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 52 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+#line 53 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_VERSION(16);
 
-char currentPointRelease[6] = "16.00";
+char currentPointRelease[6] = "16.11";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -681,15 +682,16 @@ void serviceSensorEvent()                                             // We only
     snprintf(occupancyStateStr, sizeof(occupancyStateStr), "Occupied");  // Update the string for the Particle variable
     Log.info(occupancyStateStr);
     current.lastOccupancyChange = Time.now();
+    state = REPORTING_STATE;                                            // Need to report our new daily number
   }
   else {                                                              // Already occupied - we need to update the time
     if (Time.now() - lastReportedTime > occupancyUpdateMins) {        // We are occupied but we need to report every so often - this is the time to do it
       int newMinutes = round((Time.now() - current.lastOccupancyChange)/60.0);
       current.lastOccupancyChange = Time.now();
-      current.dailyOccupancyMinutes += newMinutes;
+      current.dailyOccupancyMinutes += newMinutes;                    // Update daily minutes - note rounding could introduce drift over time
+      state = REPORTING_STATE;                                        // Need to report our new daily number
     }
   }
-  state = REPORTING_STATE;                                            // Need to report our new daily number
   sensorDetect = false;                                               // Reset the flag
   currentStatusWriteNeeded = true;                                    // Write updated values to FRAM
 }
