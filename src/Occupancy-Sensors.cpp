@@ -41,6 +41,7 @@
 //v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing.  
 //v16.10 - Added regular updates when occupied the minutes are set on line 125
 //v16.11 - Added a check to reduce reporting
+//v16.12 - Updated with latest deviceOS@6.3.3 - Last v16 build - uploading to Particle
 
 
 // Included Libraries
@@ -93,7 +94,7 @@ void dailyCleanup();
 #line 53 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
 PRODUCT_VERSION(16);
 
-char currentPointRelease[6] = "16.11";
+char currentPointRelease[6] = "16.12";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
