@@ -41,7 +41,7 @@
 //v16.00 - Issue with the variable type which could be causing memory corruption - Added an off-line mode for testing.  
 //v16.10 - Added regular updates when occupied the minutes are set on line 125
 //v16.11 - Added a check to reduce reporting
-//v16.12 - Updated with latest deviceOS@6.3.3 - Last v16 build - uploading to Particle
+//v17.00 - Initial version for the next set of updates
 
 
 // Included Libraries
@@ -91,10 +91,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 53 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
-PRODUCT_VERSION(16);
+#line 54 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+PRODUCT_VERSION(17);
 
-char currentPointRelease[6] = "16.12";
+char currentPointRelease[6] = "17.00";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -347,20 +347,23 @@ void setup()                                        // Note: Disconnected Setup(
 
 void loop()
 {
+  if (Time.isValid() && !timeToSleep() && Time.day() != Time.day(current.lastOccupancyChange)) dailyCleanup();  // Once a day - first loop of open hours on a new day (before any occupancy is processed)
+
   switch(state) {
   case IDLE_STATE:                                                     // Where we spend most time - note, the order of these conditionals is important
     if (state != oldState) {
       publishStateTransition();
       Log.info("Idle state - Hours are %i, open is %i, close is %i and hour of last report is %i",Time.hour(), sysStatus.openTime, sysStatus.closeTime, Time.hour(lastReportedTime));
-    } 
+    }
+    if (timeToSleep()) { sensorDetect = false; state = SLEEPING_STATE; break; }  // The park is closed - sleep (SLEEPING_STATE clears and reports occupancy)
     if (sensorDetect) serviceSensorEvent();                           // The ISR had raised the sensor flag - we can service it here as we don't need to catch every one like when counting cars
     if (current.occupancyStatus && (Time.now() >= current.lastOccupancyTime + current.debounceMin * 60)) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
+    if (state == REPORTING_STATE) break;                              // Don't let the nap / hourly checks overwrite a pending occupancy report
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (Time.hour() != Time.hour(lastReportedTime)) {
         stayAwake = stayAwakeLong;                                    // Keeps device awake after reboot - helps with recovery
         state = REPORTING_STATE;                                      // We want to report on the hour but not after bedtime
-    }     
-    if (timeToSleep()) state = SLEEPING_STATE;                        // The park is closed - sleep
+    }
     break;
 
   case SLEEPING_STATE: {                                               // This state is triggered once the park closes and runs until it opens - Sensor is off and interrupts disconnected
@@ -428,6 +431,7 @@ void loop()
     }
     delay(200);                     // Time to write to the Log
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
+    if (result.wakeupPin() == intPin) sensorDetect = true;             // PIR woke us - make sure the event is serviced even if the ISR did not fire
     Log.info("Waking");
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
     fuelGauge.wakeup();                                                // Make sure the fuelGauge is woke
@@ -466,8 +470,8 @@ void loop()
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;
         }                                                              // Leave this state and go connect - will return only if we are successful in connecting
-        else if (sysStatus.stateOfCharge <= 65 && (Time.hour() - sysStatus.lastConnection < 3600)) { // If the battery level is 50% -  65%, connect only once an hour
-          Log.info("Connecting but 50-65%% charge - two hour schedule");
+        else if (sysStatus.stateOfCharge <= 65 && (Time.now() - sysStatus.lastConnection < 3600L)) { // If the battery level is 50% -  65%, connect only once an hour
+          Log.info("Connecting but 50-65%% charge - one hour schedule");
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;                                                       // Leave this state and go connect - will return only if we are successful in connecting
         }
@@ -510,7 +514,6 @@ void loop()
     lastReportedTime = Time.now();                                    // We are only going to report once each hour from the IDLE state.  We may or may not connect to Particle
     takeMeasurements();                                               // Take Measurements here for reporting
     Log.info("Measurements taken - on to sending");
-    if (Time.hour() == sysStatus.openTime) dailyCleanup();            // Once a day, clean house and publish to Google Sheets
     sendEvent();                                                      // Publish hourly but not at opening time as there is nothing to publish
     state = CONNECTING_STATE;                                         // We are only passing through this state once each hour
     break;
@@ -686,7 +689,7 @@ void serviceSensorEvent()                                             // We only
     state = REPORTING_STATE;                                            // Need to report our new daily number
   }
   else {                                                              // Already occupied - we need to update the time
-    if (Time.now() - lastReportedTime > occupancyUpdateMins) {        // We are occupied but we need to report every so often - this is the time to do it
+    if (Time.now() - lastReportedTime > occupancyUpdateMins * 60L) {        // We are occupied but we need to report every so often - this is the time to do it
       int newMinutes = round((Time.now() - current.lastOccupancyChange)/60.0);
       current.lastOccupancyChange = Time.now();
       current.dailyOccupancyMinutes += newMinutes;                    // Update daily minutes - note rounding could introduce drift over time
@@ -1222,7 +1225,7 @@ void fullModemReset() {  //
 /**
  * @brief Cleanup function that is run at the end of the day.
  * 
- * @details Syncs time with remote service and sets low power mode. Called from Reporting State ONLY.
+ * @details Syncs time with remote service and sets low power mode. Called once a day from the top of loop().
  * Clean house at the end of the day
  */
 void dailyCleanup() {
