@@ -44,6 +44,11 @@
 //v17.00 - Initial version for the next set of updates
 //v18.00 - Minor updates to improve reporting accuracy
 //v18.01 - Boot-time report fix, nap race guard, occupancy processing during connection attempts.
+//v19.00 - Drain the publish queue before napping / disconnecting, 50-65% SoC connects once per clock hour so the top-of-hour report is not skipped.
+//v19.01 - Solar / connectivity: keep our PMIC settings, charge to 113F, no quickStart in loop, shorter hourly stay-awake at <=65%, 11 min connect timeout with backoff after failure, modem off before deepPowerDown.
+//v19.02 - Review fixes: modem stays in standby if a connection is due within 10 mins, charging stops at 43C / resumes below 40C (unrounded), queue drain deadline cannot be extended, no power-down unless the modem confirms off, PMIC re-applied at most once a day.
+//v19.03 - Charging disable kept in the power config (Device OS reloads it on wake), drain deadline cleared whenever the queue empties.
+//v19.04 - Power config persisted outside the PMIC lock (deadlock), first power config applied after the first temperature reading (hot boot).
 
 
 // Included Libraries
@@ -60,6 +65,7 @@
 // Particle Product definitions
 void setup();
 void loop();
+bool readyToDisconnect();
 bool timeToSleep();
 void sensorControl(bool enableSensor);
 void  recordConnectionDetails();
@@ -93,10 +99,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 56 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
-PRODUCT_VERSION(18);
+#line 61 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+PRODUCT_VERSION(19);
 
-char currentPointRelease[6] = "18.01";
+char currentPointRelease[6] = "19.04";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -131,7 +137,8 @@ struct systemStatus_structure sysStatus;
 
 // exceeded, do a deep power down. This should not be less than 10 minutes. 11 minutes
 // is a reasonable value to use.
-unsigned long connectMaxTimeSec = 10 * 60;   // Timeout for trying to connect to Particle cloud in seconds - reduced to 10 mins
+unsigned long connectMaxTimeSec = 11 * 60;   // Timeout for trying to connect to Particle cloud in seconds - 11 mins lets Device OS power cycle the modem at 10 mins
+const unsigned long failedConnectBackoffSec = 30 * 60;  // After a failed connection, wait this long before trying again (carrier aggressive reconnection limit)
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
@@ -170,6 +177,7 @@ const int ledPower =      MISO;                     // Allows us to control the 
 const int occupancyUpdateMins = 15;                 // Set this value to get regular updates to daily occupancy when occupied = true                     
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
 const unsigned long stayAwakeLong = 90000;          // In lowPowerMode, how long to stay awake every hour
+const unsigned long stayAwakeLowSoC = 30000;        // Hourly stay awake when the battery is 65% or less - the queue drains before we nap anyway
 const unsigned long webhookWait = 30000;            // How long will we wait for a WebHook response
 const unsigned long resetWait = 30000;              // How long will we wait in ERROR_STATE until reset
 unsigned long stayAwakeTimeStamp = 0;               // Timestamps for our timing variables..
@@ -178,6 +186,11 @@ unsigned long webhookTimeStamp = 0;                 // Webhooks...
 unsigned long resetTimeStamp = 0;                   // Resets - this keeps you from falling into a reset loop
 char currentOffsetStr[10];                          // What is our offset from UTC
 unsigned long lastReportedTime = 0;                 // Need to keep this separate from time so we know when to report
+retained time_t lastFailedConnection = 0;           // When our last connection attempt timed out - drives the reconnection backoff (retained so an ERROR_STATE reset does not clear it)
+bool hardResetRequested = false;                    // Set by the Hard-Reset function, acted on in the main loop
+unsigned long drainStartMs = 0;                     // When the current wait for the publish queue to empty began (0 = not waiting)
+float temperatureC = 20.0;                          // Unrounded TMP36 reading - used for charging decisions
+bool chargingAllowed = true;                        // Thermal charging policy - applied through the power config so Device OS keeps it after sleep
 unsigned long connectionStartTime;
 
 
@@ -318,9 +331,6 @@ void setup()                                        // Note: Disconnected Setup(
   // Strings make it easier to read the system values in the console / mobile app
   makeUpStringMessages();                                              // Updated system settings - refresh the string messages
 
-  // Make sure we have the right power settings
-  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
-
   // Here is where the code diverges based on why we are running Setup()
   // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over  
   if (Time.day() != Time.day(current.lastOccupancyChange)) {           // Check to see if the device was last on in a different day
@@ -328,6 +338,8 @@ void setup()                                        // Note: Disconnected Setup(
   }
 
   takeMeasurements();                                                  // Populates values so you can read them before the hour
+  // Make sure we have the right power settings - after takeMeasurements() so a hot boot never enables charging
+  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
   if (sysStatus.lowBatteryMode) setLowPowerMode("1");                  // If battery is low we need to go to low power state
 
   lastReportedTime = Time.now();                                       // Closed-hours boot must not look like a final report is owed
@@ -366,9 +378,9 @@ void loop()
       state = REPORTING_STATE;
     }
     if (state == REPORTING_STATE) break;                              // Don't let the nap / hourly checks overwrite a pending occupancy report
-    if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
+    if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake && readyToDisconnect()) state = NAPPING_STATE;  // Nap only once queued reports are delivered
     if (Time.hour() != Time.hour(lastReportedTime)) {
-        stayAwake = stayAwakeLong;                                    // Keeps device awake after reboot - helps with recovery
+        stayAwake = (sysStatus.stateOfCharge <= 65) ? stayAwakeLowSoC : stayAwakeLong;  // Time for updates / remote commands - shorter when the battery is low
         state = REPORTING_STATE;                                      // We want to report on the hour but not after bedtime
     }
     break;
@@ -381,6 +393,7 @@ void loop()
       if (current.occupancyStatus) serviceDebounceEvent(); else state = REPORTING_STATE;
       break;
     }
+    if (!readyToDisconnect()) break;                                   // Let the end-of-day reports drain before the radio goes off
     if (Particle.connected() || !Cellular.isOff()) disconnectFromParticle();  // Disconnect cleanly from Particle
     stayAwake = 1000;                                                  // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     state = IDLE_STATE;                                                // Head back to the idle state after we sleep
@@ -421,7 +434,8 @@ void loop()
     else wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);  // Not occupied so wait till the next hour
     wakeInSeconds = min(wakeInSeconds, (int)(wakeBoundary - Time.now() % wakeBoundary));   // Always wake for the top-of-hour report
     if (current.occupancyStatus) wakeInSeconds = constrain(min(wakeInSeconds, (int)((long)lastReportedTime + occupancyUpdateMins * 60L - Time.now())), 1, wakeBoundary);
-    if (sysStatus.stateOfCharge > 65) {                                // Will stay on network standby if we have the power
+    bool connectionDueSoon = !Cellular.isOff() && !sysStatus.lowBatteryMode && (sysStatus.stateOfCharge > 50 || (Time.hour() + 1) % 3 == 0) && wakeBoundary - Time.now() % wakeBoundary < 600;  // Modem off now would be back on within 10 mins (aggressive reconnection)
+    if (sysStatus.stateOfCharge > 65 || connectionDueSoon) {           // Will stay on network standby if we have the power or will need the network shortly
       Log.info("Napping with radio on");
       config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
@@ -480,11 +494,16 @@ void loop()
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;
         }                                                              // Leave this state and go connect - will return only if we are successful in connecting
-        else if (sysStatus.stateOfCharge <= 65 && (Time.now() - sysStatus.lastConnection < 3600L)) { // If the battery level is 50% -  65%, connect only once an hour
+        else if (sysStatus.stateOfCharge <= 65 && (Time.now() / 3600L == sysStatus.lastConnection / 3600L)) { // 50% - 65%: at most one connection per clock hour
           Log.info("Connecting but 50-65%% charge - one hour schedule");
           state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
           break;                                                       // Leave this state and go connect - will return only if we are successful in connecting
         }
+      }
+      if (lastFailedConnection && Time.now() >= lastFailedConnection && Time.now() - lastFailedConnection < (time_t)failedConnectBackoffSec && digitalRead(userSwitch)) {  // Recently failed - don't hammer the carrier
+        Log.info("Connecting state but backing off after a failed connection");
+        state = IDLE_STATE;                                            // Reports stay in the queue until the next allowed attempt
+        break;
       }
       // OK, let's do this thing!
       connectionStartTimeStamp = millis();                             // Have to use millis as the clock will get reset on connect
@@ -501,6 +520,7 @@ void loop()
         waitFor(Particle.syncTimeDone,30000);                          // Wait for up to 30 seconds for the SyncTime to complete
       }
       sysStatus.lastConnection = Time.now();                           // This is the last time we attempted to connect
+      lastFailedConnection = 0;                                        // Connected - clear the backoff
       stayAwakeTimeStamp = millis();
       recordConnectionDetails();                                       // Record outcome of connection attempt
       (retainedOldState == REPORTING_STATE) ? state = RESP_WAIT_STATE : state = IDLE_STATE;
@@ -509,6 +529,7 @@ void loop()
       recordConnectionDetails();                                       // Record outcome of connection attempt
       Log.info("cloud connection unsuccessful");
       disconnectFromParticle();                                        // Make sure the modem is turned off
+      lastFailedConnection = Time.now();                               // Start the backoff - next attempt no sooner than failedConnectBackoffSec
       if (sysStatus.solarPowerMode) setLowPowerMode("1");              // If we cannot connect, there is no point to stayng out of low power mode
       if ((Time.now() - sysStatus.lastConnection) > 3 * 3600L) {       // Only sends to ERROR_STATE if it has been over three hours - this ties to reporting and low battery state
         state = ERROR_STATE;
@@ -558,12 +579,13 @@ void loop()
         Particle.publish("ERROR_STATE", errorStr, PRIVATE);
         Log.info(errorStr);
         delay(2000);
-        disconnectFromParticle();                                      // Since we are resetting, let's disconnect cleanly
       }
+      bool modemOff = disconnectFromParticle();                        // Always turn the modem off cleanly before a reset or power down - even if we never connected
 
       switch (current.alerts) {                                        // For now, no default state as there are only a few paths that lead to this state
         case 12:                                                       // This is an initialization error - likely FRAM - need to power cycle to clear
-          ab1805.deepPowerDown();                                      // 30 second power cycle of Boron including cellular modem, carrier board and all peripherals
+          if (modemOff) ab1805.deepPowerDown();                        // 30 second power cycle of Boron including cellular modem, carrier board and all peripherals
+          System.reset();                                              // Modem did not confirm off (never cut its power) or the power down failed
           break;
 
         case 30 ... 31:                                                // Device failed to connect too many times
@@ -581,7 +603,8 @@ void loop()
           fram.put(FRAM::currentStateAddr,current);
           fram.put(FRAM::systemStatusAddr,sysStatus);                  // Won't get back to the main loop
           delay (100);
-          ab1805.deepPowerDown();                                      // 30 second power cycle of Boron including cellular modem, carrier board and all peripherals
+          if (modemOff) ab1805.deepPowerDown();                        // 30 second power cycle of Boron including cellular modem, carrier board and all peripherals
+          System.reset();                                              // Modem did not confirm off (never cut its power) or the power down failed
           break;
 
         case 14:                                                       // This is an out of memory error
@@ -610,6 +633,12 @@ void loop()
 
   // Take care of housekeeping items here
 
+  if (hardResetRequested) {                                            // Requested from the console - power the modem down cleanly first
+    if (disconnectFromParticle()) ab1805.deepPowerDown(10);            // Only cut power once the modem confirms it is off
+    System.reset();                                                    // Modem did not confirm off, or the power down failed
+  }
+
+  if (!Particle.connected() || PublishQueuePosix::instance().getNumEvents() == 0) drainStartMs = 0;  // Drain over (in any mode) - the next wait gets a fresh deadline
   ab1805.loop();                                                       // Keeps the RTC synchronized with the Boron's clock
 
   PublishQueuePosix::instance().loop();                                // Check to see if we need to tend to the message queue
@@ -629,6 +658,14 @@ void loop()
     state = ERROR_STATE;
   }
   // End of housekeeping - end of main loop
+}
+
+const unsigned long queueDrainMaxMs = 120000;      // Longest we will stay connected waiting for the publish queue to empty
+
+bool readyToDisconnect() {                         // True if the queue is empty, we are offline, or we have waited long enough
+  if (!Particle.connected() || PublishQueuePosix::instance().getNumEvents() == 0) return true;  // Offline (cannot drain) or nothing left to send
+  if (drainStartMs == 0) drainStartMs = millis();  // Start the deadline once - new reports while we wait do not extend it
+  return (millis() - drainStartMs > queueDrainMaxMs);
 }
 
 bool timeToSleep() {          // Returns true if we should be sleeping
@@ -765,18 +802,16 @@ void takeMeasurements()
   getTemperature();                                                    // Get Temperature at startup as well
 
   sysStatus.batteryState = System.batteryState();                      // Call before isItSafeToCharge() as it may overwrite the context
+  int pmicBatteryState = sysStatus.batteryState;                       // Keep the raw value - isItSafeToCharge() may overwrite it with "Not Charging"
 
-  isItSafeToCharge();                                                  // See if it is safe to charge
+  bool safeToCharge = isItSafeToCharge();                              // See if it is safe to charge
 
-  if (sysStatus.lowPowerMode) {                                        // Need to take these steps if we are sleeping
-    fuelGauge.quickStart();                                            // May help us re-establish a baseline for SoC
-    delay(500);
-  }
+  sysStatus.stateOfCharge = int(fuelGauge.getSoC());                   // Assign to system value - no quickStart here, it is skewed by charge / radio current
 
-  sysStatus.stateOfCharge = int(fuelGauge.getSoC());                   // Assign to system value
-
-  if (sysStatus.stateOfCharge < 65 && sysStatus.batteryState == 1) {
-    System.setPowerConfiguration(SystemPowerConfiguration());          // Reset the PMIC
+  static int pmicReappliedDay = -1;                                    // Only re-apply once a day - not charging is normal in low light
+  if (sysStatus.stateOfCharge < 65 && pmicBatteryState == 1 && safeToCharge && Time.day() != pmicReappliedDay) {  // Not charging for a reason other than temperature
+    setPowerConfig();                                                  // Re-apply our solar / DC settings - not the PMIC defaults
+    pmicReappliedDay = Time.day();
     current.alerts = 11;                                               // Keep track of this
   }
 
@@ -796,8 +831,12 @@ void takeMeasurements()
 
 bool isItSafeToCharge()                                                // Returns a true or false if the battery is in a safe charging range.
 {
-  PMIC pmic(true);
-  if (current.temperature < 36 || current.temperature > 100 )  {       // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (32 to 113 but with safety)
+  static bool tooHot = false;                                          // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (0C to 45C)
+  tooHot = (temperatureC >= 43.0) || (tooHot && temperatureC >= 40.0); // Off at 43C, back on below 40C - sensor is a few mm from the battery, TMP36 is +/-2C
+  bool allowed = !tooHot && temperatureC >= 2.2;                      // 2.2C = 36F
+  if (allowed != chargingAllowed) { chargingAllowed = allowed; setPowerConfig(); }  // Persist in the power config - Device OS reloads it on wake, undoing a direct PMIC write
+  PMIC pmic(true);                                                     // Lock only after the config is queued - Power Manager needs this lock to take it from its queue
+  if (!allowed) {
     pmic.disableCharging();                                            // It is too cold or too hot to safely charge the battery
     sysStatus.batteryState = 1;                                        // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
     current.alerts = 10;                                                // Set a value of 1 indicating that it is not safe to charge due to high / low temps
@@ -831,8 +870,8 @@ int getTemperature()
   int reading = analogRead(tmp36Pin);                                 //getting the voltage reading from the temperature sensor
   float voltage = reading * 3.3;                                      // converting that reading to voltage, for 3.3v arduino use 3.3
   voltage /= 4096.0;                                                  // Electron is different than the Arduino where there are only 1024 steps
-  int temperatureC = int(((voltage - 0.5) * 100));                    //converting from 10 mv per degree with 500 mV offset to degrees ((voltage - 500mV) times 100) - 5 degree calibration
-  current.temperature = int((temperatureC * 9.0 / 5.0) + 32.0);              // now convert to Fahrenheit
+  temperatureC = (voltage - 0.5) * 100;                               // 10 mV per degree with a 500 mV offset - unrounded for charging decisions
+  current.temperature = int((int(temperatureC) * 9.0 / 5.0) + 32.0);  // Reported value in Fahrenheit - same rounding as before
   currentStatusWriteNeeded=true;
   return current.temperature;
 }
@@ -851,8 +890,8 @@ void sensorISR()
 
 // Power Management function
 int setPowerConfig() {
-  SystemPowerConfiguration conf;
-  System.setPowerConfiguration(SystemPowerConfiguration());  // To restore the default configuration
+  SystemPowerConfiguration conf;                                       // Starts from the defaults - applied in one call so the PMIC never runs on defaults in between
+  if (!chargingAllowed) conf.feature(SystemPowerFeature::DISABLE_CHARGING);  // Too hot / cold - survives the Power Manager reload on wake
   if (sysStatus.solarPowerMode) {
     conf.powerSourceMaxCurrent(900) // Set maximum current the power source can provide (applies only when powered through VIN)
         .powerSourceMinVoltage(5080) // Set minimum voltage the power source can provide (applies only when powered through VIN)
@@ -965,9 +1004,8 @@ bool disconnectFromParticle()                                          // Ensure
   waitFor(Particle.disconnected, 15000);                               // make sure before turning off the cellular modem
   Cellular.disconnect();                                               // Disconnect from the cellular network
   Cellular.off();                                                      // Turn off the cellular modem
-  waitFor(Cellular.isOff, 30000);                                      // As per TAN004: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
   systemStatusWriteNeeded = true;
-  return true;
+  return waitFor(Cellular.isOff, 30000);                               // As per TAN004 - false if the modem did not confirm off, callers must not cut power: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
 }
 
 int resetCounts(String command)                                       // Resets the current hourly and daily counts
@@ -990,7 +1028,7 @@ int hardResetNow(String command)                                      // Will pe
   if (command == "1")
   {
     if (Particle.connected()) Particle.publish("Reset","Hard Reset in 2 seconds",PRIVATE);
-    ab1805.deepPowerDown(10);
+    hardResetRequested = true;                                        // Main loop turns the modem off cleanly, then powers down
     return 1;                                                         // Unfortunately, this will never be sent
   }
   else return 0;
