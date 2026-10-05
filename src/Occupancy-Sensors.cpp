@@ -42,6 +42,8 @@
 //v16.10 - Added regular updates when occupied the minutes are set on line 125
 //v16.11 - Added a check to reduce reporting
 //v17.00 - Initial version for the next set of updates
+//v18.00 - Minor updates to improve reporting accuracy
+//v18.01 - Boot-time report fix, nap race guard, occupancy processing during connection attempts.
 
 
 // Included Libraries
@@ -91,10 +93,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void fullModemReset();
 void dailyCleanup();
-#line 54 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
-PRODUCT_VERSION(17);
+#line 56 "/Users/chipmc/Documents/Maker/Particle/Projects/Occupancy-Sensors/src/Occupancy-Sensors.ino"
+PRODUCT_VERSION(18);
 
-char currentPointRelease[6] = "17.00";
+char currentPointRelease[6] = "18.01";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -328,9 +330,9 @@ void setup()                                        // Note: Disconnected Setup(
   takeMeasurements();                                                  // Populates values so you can read them before the hour
   if (sysStatus.lowBatteryMode) setLowPowerMode("1");                  // If battery is low we need to go to low power state
 
+  lastReportedTime = Time.now();                                       // Closed-hours boot must not look like a final report is owed
   if ((Time.hour() >= sysStatus.openTime) && (Time.hour() < sysStatus.closeTime)) { // Park is open let's get ready for the day
     sensorControl(true);                                               // Turn on the sensor
-    current.occupancyStatus = false;                                   // Reset at power up
     attachInterrupt(intPin, sensorISR, RISING);                        // Sensor interrupt from low to high
     stayAwake = stayAwakeLong;                                         // Keeps Boron awake after reboot - helps with recovery
     lastReportedTime = current.lastOccupancyChange;                    // When did we last see a change in occupancy
@@ -358,6 +360,11 @@ void loop()
     if (timeToSleep()) { sensorDetect = false; state = SLEEPING_STATE; break; }  // The park is closed - sleep (SLEEPING_STATE clears and reports occupancy)
     if (sensorDetect) serviceSensorEvent();                           // The ISR had raised the sensor flag - we can service it here as we don't need to catch every one like when counting cars
     if (current.occupancyStatus && (Time.now() >= current.lastOccupancyTime + current.debounceMin * 60)) serviceDebounceEvent();   // Ran out of time waiting for next event - court now unoccupied
+    if (current.occupancyStatus && state != REPORTING_STATE && Time.now() - lastReportedTime >= occupancyUpdateMins * 60L) {
+      current.dailyOccupancyMinutes += round((Time.now() - current.lastOccupancyChange)/60.0);
+      current.lastOccupancyChange = Time.now();
+      state = REPORTING_STATE;
+    }
     if (state == REPORTING_STATE) break;                              // Don't let the nap / hourly checks overwrite a pending occupancy report
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (Time.hour() != Time.hour(lastReportedTime)) {
@@ -370,8 +377,8 @@ void loop()
     if (state != oldState) publishStateTransition();
     detachInterrupt(intPin);                                           // Done sensing for the day
     sensorControl(false);                                              // Turn off the sensor module for the hour
-    if (current.occupancyStatus) {                                     // If the court is still showing as occupied, we need to wait
-      serviceDebounceEvent();                                          // Reset for the day
+    if (current.occupancyStatus || (Time.hour(lastReportedTime) >= sysStatus.openTime && Time.hour(lastReportedTime) < sysStatus.closeTime)) {  // Final report of the day not sent yet
+      if (current.occupancyStatus) serviceDebounceEvent(); else state = REPORTING_STATE;
       break;
     }
     if (Particle.connected() || !Cellular.isOff()) disconnectFromParticle();  // Disconnect cleanly from Particle
@@ -412,6 +419,8 @@ void loop()
       wakeInSeconds = constrain((current.debounceMin* 60 - (Time.now() - current.lastOccupancyTime)),1,current.debounceMin*60); // Need to calc based on delay
     }
     else wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);  // Not occupied so wait till the next hour
+    wakeInSeconds = min(wakeInSeconds, (int)(wakeBoundary - Time.now() % wakeBoundary));   // Always wake for the top-of-hour report
+    if (current.occupancyStatus) wakeInSeconds = constrain(min(wakeInSeconds, (int)((long)lastReportedTime + occupancyUpdateMins * 60L - Time.now())), 1, wakeBoundary);
     if (sysStatus.stateOfCharge > 65) {                                // Will stay on network standby if we have the power
       Log.info("Napping with radio on");
       config.mode(SystemSleepMode::ULTRA_LOW_POWER)
@@ -430,6 +439,7 @@ void loop()
       if (Particle.connected() || Cellular.isOn()) disconnectFromParticle();  // This will turn off the cellular radio
     }
     delay(200);                     // Time to write to the Log
+    if (sensorDetect) { ab1805.resumeWDT(); break; }                   // Motion arrived while preparing to nap - service it first
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     if (result.wakeupPin() == intPin) sensorDetect = true;             // PIR woke us - make sure the event is serviced even if the ISR did not fire
     Log.info("Waking");
@@ -590,6 +600,14 @@ void loop()
     } break;
 
   }
+
+  if ((state == CONNECTING_STATE || state == RESP_WAIT_STATE) && !timeToSleep()) {   // Keep occupancy current during long connection attempts
+    State resumeState = state;
+    if (sensorDetect) serviceSensorEvent();
+    if (current.occupancyStatus && Time.now() >= current.lastOccupancyTime + current.debounceMin * 60L) serviceDebounceEvent();
+    if (state == REPORTING_STATE) { lastReportedTime = Time.now(); sendEvent(); state = resumeState; }
+  }
+
   // Take care of housekeeping items here
 
   ab1805.loop();                                                       // Keeps the RTC synchronized with the Boron's clock
