@@ -42,8 +42,6 @@
 //v19.00 - Drain the publish queue before napping / disconnecting, 50-65% SoC connects once per clock hour so the top-of-hour report is not skipped.
 //v19.01 - Solar / connectivity: keep our PMIC settings, charge to 113F, no quickStart in loop, shorter hourly stay-awake at <=65%, 11 min connect timeout with backoff after failure, modem off before deepPowerDown.
 //v19.02 - Review fixes: modem stays in standby if a connection is due within 10 mins, charging stops at 43C / resumes below 40C (unrounded), queue drain deadline cannot be extended, no power-down unless the modem confirms off, PMIC re-applied at most once a day.
-//v19.03 - Charging disable kept in the power config (Device OS reloads it on wake), drain deadline cleared whenever the queue empties.
-//v19.04 - Power config persisted outside the PMIC lock (deadlock), first power config applied after the first temperature reading (hot boot).
 
 
 // Included Libraries
@@ -60,7 +58,7 @@
 // Particle Product definitions
 PRODUCT_VERSION(19);
 
-char currentPointRelease[6] = "19.04";
+char currentPointRelease[6] = "19.02";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -148,7 +146,6 @@ retained time_t lastFailedConnection = 0;           // When our last connection 
 bool hardResetRequested = false;                    // Set by the Hard-Reset function, acted on in the main loop
 unsigned long drainStartMs = 0;                     // When the current wait for the publish queue to empty began (0 = not waiting)
 float temperatureC = 20.0;                          // Unrounded TMP36 reading - used for charging decisions
-bool chargingAllowed = true;                        // Thermal charging policy - applied through the power config so Device OS keeps it after sleep
 unsigned long connectionStartTime;
 
 
@@ -289,6 +286,9 @@ void setup()                                        // Note: Disconnected Setup(
   // Strings make it easier to read the system values in the console / mobile app
   makeUpStringMessages();                                              // Updated system settings - refresh the string messages
 
+  // Make sure we have the right power settings
+  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
+
   // Here is where the code diverges based on why we are running Setup()
   // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over  
   if (Time.day() != Time.day(current.lastOccupancyChange)) {           // Check to see if the device was last on in a different day
@@ -296,8 +296,6 @@ void setup()                                        // Note: Disconnected Setup(
   }
 
   takeMeasurements();                                                  // Populates values so you can read them before the hour
-  // Make sure we have the right power settings - after takeMeasurements() so a hot boot never enables charging
-  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
   if (sysStatus.lowBatteryMode) setLowPowerMode("1");                  // If battery is low we need to go to low power state
 
   lastReportedTime = Time.now();                                       // Closed-hours boot must not look like a final report is owed
@@ -596,7 +594,6 @@ void loop()
     System.reset();                                                    // Modem did not confirm off, or the power down failed
   }
 
-  if (!Particle.connected() || PublishQueuePosix::instance().getNumEvents() == 0) drainStartMs = 0;  // Drain over (in any mode) - the next wait gets a fresh deadline
   ab1805.loop();                                                       // Keeps the RTC synchronized with the Boron's clock
 
   PublishQueuePosix::instance().loop();                                // Check to see if we need to tend to the message queue
@@ -621,7 +618,7 @@ void loop()
 const unsigned long queueDrainMaxMs = 120000;      // Longest we will stay connected waiting for the publish queue to empty
 
 bool readyToDisconnect() {                         // True if the queue is empty, we are offline, or we have waited long enough
-  if (!Particle.connected() || PublishQueuePosix::instance().getNumEvents() == 0) return true;  // Offline (cannot drain) or nothing left to send
+  if (!Particle.connected() || PublishQueuePosix::instance().getNumEvents() == 0) { drainStartMs = 0; return true; }  // Offline (cannot drain) or nothing left to send
   if (drainStartMs == 0) drainStartMs = millis();  // Start the deadline once - new reports while we wait do not extend it
   return (millis() - drainStartMs > queueDrainMaxMs);
 }
@@ -789,12 +786,10 @@ void takeMeasurements()
 
 bool isItSafeToCharge()                                                // Returns a true or false if the battery is in a safe charging range.
 {
+  PMIC pmic(true);
   static bool tooHot = false;                                          // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (0C to 45C)
   tooHot = (temperatureC >= 43.0) || (tooHot && temperatureC >= 40.0); // Off at 43C, back on below 40C - sensor is a few mm from the battery, TMP36 is +/-2C
-  bool allowed = !tooHot && temperatureC >= 2.2;                      // 2.2C = 36F
-  if (allowed != chargingAllowed) { chargingAllowed = allowed; setPowerConfig(); }  // Persist in the power config - Device OS reloads it on wake, undoing a direct PMIC write
-  PMIC pmic(true);                                                     // Lock only after the config is queued - Power Manager needs this lock to take it from its queue
-  if (!allowed) {
+  if (tooHot || temperatureC < 2.2) {                                  // 2.2C = 36F
     pmic.disableCharging();                                            // It is too cold or too hot to safely charge the battery
     sysStatus.batteryState = 1;                                        // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
     current.alerts = 10;                                                // Set a value of 1 indicating that it is not safe to charge due to high / low temps
@@ -849,7 +844,6 @@ void sensorISR()
 // Power Management function
 int setPowerConfig() {
   SystemPowerConfiguration conf;                                       // Starts from the defaults - applied in one call so the PMIC never runs on defaults in between
-  if (!chargingAllowed) conf.feature(SystemPowerFeature::DISABLE_CHARGING);  // Too hot / cold - survives the Power Manager reload on wake
   if (sysStatus.solarPowerMode) {
     conf.powerSourceMaxCurrent(900) // Set maximum current the power source can provide (applies only when powered through VIN)
         .powerSourceMinVoltage(5080) // Set minimum voltage the power source can provide (applies only when powered through VIN)

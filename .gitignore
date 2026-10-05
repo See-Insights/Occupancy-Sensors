@@ -47,3 +47,7 @@ VSCode Stuff
 *.lst
 *.bin.*
 *.map
+
+# Host simulation build and generated traces
+test/sim/out/
+test/sim/sim

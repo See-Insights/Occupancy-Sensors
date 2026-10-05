@@ -1,0 +1,75 @@
+{
+  "nonet": {
+    "4": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "repeat 0 at 09-29 06:11:32 (692 s after previous) daily=0",
+        "repeat 0 at 09-29 09:01:12 (361 s after previous) daily=60",
+        "repeat 1 at 09-29 10:01:45 (692 s after previous) daily=60"
+      ]
+    },
+    "5": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "no report at 09-29 09:00:00",
+        "no report at 09-29 10:00:00"
+      ]
+    }
+  },
+  "badnet": {
+    "4": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "repeat 0 at 09-29 09:01:12 (361 s after previous) daily=60",
+        "repeat 1 at 09-29 10:01:14 (661 s after previous) daily=60",
+        "repeat 0 at 09-29 11:11:32 (691 s after previous) daily=95"
+      ]
+    },
+    "5": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "no report at 09-29 09:00:00",
+        "no report at 09-29 10:00:00"
+      ]
+    }
+  },
+  "badnetlow": {
+    "4": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "repeat 0 at 09-29 09:01:12 (361 s after previous) daily=60",
+        "repeat 1 at 09-29 10:01:45 (692 s after previous) daily=60",
+        "repeat 0 at 09-29 13:11:32 (692 s after previous) daily=103"
+      ]
+    },
+    "5": {
+      "reason": "Existing hourly generation is delayed by an ongoing failed connection attempt.",
+      "messages": [
+        "no report at 09-29 09:00:00",
+        "no report at 09-29 10:00:00"
+      ]
+    }
+  },
+  "hardreset": {
+    "4": {
+      "reason": "Expected 10-second power-down shifts the 11:00 report.",
+      "messages": [
+        "repeat 0 at 09-29 11:00:11 (2098 s after previous) daily=95"
+      ]
+    },
+    "5": {
+      "reason": "Expected 10-second power-down shifts the 11:00 report.",
+      "messages": [
+        "no report at 09-29 11:00:00"
+      ]
+    }
+  },
+  "reboot": {
+    "7": {
+      "reason": "Known closed-hours reboot cleanup gap (fix C not applied).",
+      "messages": [
+        "2026-09-30: dailyCleanup ran 0 times []"
+      ]
+    }
+  }
+}
